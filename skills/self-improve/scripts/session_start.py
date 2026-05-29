@@ -215,6 +215,7 @@ def _recover_one(
         total_lines=total,
         candidates_file=candidates_file,
         log=log,
+        hook_event="SessionStart",
     )
     if not result.advanced:
         log.warning("  extraction failed for %s, keep active", state.session_id)

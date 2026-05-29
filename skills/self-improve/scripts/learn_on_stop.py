@@ -122,8 +122,13 @@ def run_extraction(
     total_lines: int,
     candidates_file: Path,
     log: logging.Logger,
+    hook_event: str = "Stop",
 ) -> "_ExtractResult":
     """切片 transcript → 调 LLM → append 候选。被 Stop 与 SessionStart 共用。
+
+    Args:
+        hook_event: 触发来源(``Stop`` / ``SessionStart``),用于 run 目录命名
+            与候选 ``source.hook_event``,避免恢复路径的 run 被误标成 ``Stop``。
 
     Returns:
         _ExtractResult,``advanced`` 表示是否成功推进 last_line。
@@ -151,7 +156,7 @@ def run_extraction(
     advanced = False
     with runlog.record_run(
         cwd=cwd,
-        hook_event="Stop",
+        hook_event=hook_event,
         session_id=session_id,
         model=MODEL,
         prompt=prompt,
@@ -183,6 +188,7 @@ def run_extraction(
                     transcript_path=transcript_path,
                     start_line=last_line + 1,
                     end_line=total_lines,
+                    hook_event=hook_event,
                 )
                 if enriched is None:
                     rejected += 1
@@ -240,6 +246,7 @@ def _enrich(
     transcript_path: Path,
     start_line: int,
     end_line: int,
+    hook_event: str = "Stop",
 ) -> dict[str, Any] | None:
     """补全候选条目的元信息;不合法条目返回 None。"""
     if not isinstance(item, dict):
@@ -266,7 +273,7 @@ def _enrich(
             "transcript_path": str(transcript_path),
             "start_line": start_line,
             "end_line": end_line,
-            "hook_event": "Stop",
+            "hook_event": hook_event,
         },
         "dedupe_key": hashlib.sha256(_normalize(content).encode("utf-8")).hexdigest(),
         "created_at": now.isoformat(timespec="seconds"),

@@ -11,6 +11,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+# Claude Code 在一轮对话结束后会向 transcript 追加一批非对话元数据行
+# (system / last-prompt / ai-title / mode)。它们落盘时机晚于 Stop hook 读取,
+# 故下个会话的恢复路径会把这批尾部噪声当成"新对话"切出来,塌成几个光秃秃的
+# [type] 标签——非空白但无正文,绕过空内容护栏白烧一次 LLM 调用。这里按 type
+# 黑名单直接丢弃。
+_META_TYPES = {"system", "last-prompt", "ai-title", "mode"}
+
 
 def count_lines(path: str | Path) -> int:
     """返回 jsonl 文件的总行数;文件不存在时返回 0。"""
@@ -66,11 +73,15 @@ def slim_events(events: list[dict[str, Any]], max_chars: int = 60_000) -> str:
     lines: list[str] = []
     for ev in events:
         kind = ev.get("type") or ev.get("role") or "event"
+        if kind in _META_TYPES:  # 已知元数据噪声直接丢
+            continue
         msg = ev.get("message") or {}
         role = msg.get("role") or ev.get("role")
         content = msg.get("content") if isinstance(msg, dict) else None
         text = _extract_text(content) if content is not None else _extract_text(ev.get("content"))
         tool = ev.get("tool_name") or (msg.get("tool_use", {}) or {}).get("name")
+        if not text and not tool:  # 兜底:无正文也无工具的事件不构成对话,跳过
+            continue
         parts = [f"[{kind}]"]
         if role:
             parts.append(f"role={role}")
