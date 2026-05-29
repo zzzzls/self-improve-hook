@@ -42,6 +42,30 @@ MEMORY_REF = f"@{MEMORY_FILENAME}"
 MANAGED_BEGIN = "<!-- self-improve:begin -->"
 MANAGED_END = "<!-- self-improve:end -->"
 
+# 注入到目标项目 .claude/settings.local.json 的 permissions.deny 文件保护规则。
+# memory.generated.md 仅禁写(保留 Read,否则 CLAUDE.md 的 @memory.generated.md 回注会被 deny 阻断);
+# .claude/memory/** 是流水线内部文件(候选/state/runs/archive),主会话无需访问,连读带写全禁。
+# 流水线自身写 memory.generated.md 走 Python 的 os.replace,不经 claude 工具权限,故不受这些规则影响。
+PERMISSION_DENY_RULES = (
+    "Edit(./memory.generated.md)",
+    "Write(./memory.generated.md)",
+    "Read(./.claude/memory/**)",
+    "Edit(./.claude/memory/**)",
+    "Write(./.claude/memory/**)",
+)
+
+# CLAUDE.md 托管块正文:回注记忆 + 给主会话 Claude 的禁改说明(deny 规则的人类可读对应)。
+MANAGED_BLOCK_BODY = (
+    "<self-improve>\n"
+    "以下「项目记忆」由 self-improve 流水线自动提取、合并、维护。\n"
+    "**禁止手动修改** `memory.generated.md` 以及 `.claude/memory/` 下的任何文件:\n"
+    "它们由 SessionStart/Stop hook 自动生成,手改会在下次合并时被覆盖,或破坏流水线状态;\n"
+    "settings.local.json 已用 permissions.deny 禁止对这些文件的写入。\n"
+    "如需调整记忆,请改提取/合并 prompt(skills/self-improve/scripts/prompts/)或运行 /self-improve update。\n"
+    f"{MEMORY_REF}\n"
+    "</self-improve>"
+)
+
 # (hook 事件, 脚本文件名, 超时秒数) —— 与原 settings.json1 保持一致
 HOOK_SPECS = (
     ("SessionStart", "session_start.py", 300),
@@ -248,16 +272,36 @@ def _init_config(python_path: str, claude_path: str | None, lines: list[str]) ->
 
 
 def _init_claude_md(project: Path, lines: list[str]) -> None:
-    """确保 CLAUDE.md 含 memory 引用;先检测存在性,已有则不重复追加。"""
+    """确保 CLAUDE.md 含托管块(memory 引用 + 禁改说明);已有托管块则升级为最新内容。
+
+    三种情形:
+    - 已有本工具托管块(begin/end 标记):整体替换为最新正文,可把旧的纯 @ 块
+      升级为带 deny 保护说明的新块;内容已最新则跳过。
+    - 无托管块但已有裸 ``@memory.generated.md``(用户手写):尊重原样,不重复注入。
+    - 都没有:在文件末尾追加托管块。
+    """
     path = project / CLAUDE_MD_NAME
     existed = path.exists()
     text = path.read_text(encoding="utf-8") if existed else ""
+    block = f"{MANAGED_BEGIN}\n{MANAGED_BLOCK_BODY}\n{MANAGED_END}\n"
+
+    if MANAGED_BEGIN in text and MANAGED_END in text:
+        start = text.index(MANAGED_BEGIN)
+        end = text.index(MANAGED_END) + len(MANAGED_END)
+        new_text = text[:start] + block.rstrip("\n") + text[end:]
+        if new_text == text:
+            lines.append("• CLAUDE.md 托管块已是最新,跳过")
+        else:
+            _atomic_write_text(path, new_text)
+            lines.append("• CLAUDE.md 托管块已更新(写入 memory 保护说明)")
+        return
+
     if MEMORY_REF in text:
         lines.append(f"• CLAUDE.md 已含 {MEMORY_REF},跳过追加")
         return
+
     if text and not text.endswith("\n"):
         text += "\n"
-    block = f"{MANAGED_BEGIN}\n{MEMORY_REF}\n{MANAGED_END}\n"
     separator = "\n" if text else ""
     _atomic_write_text(path, text + separator + block)
     lines.append(
@@ -266,7 +310,9 @@ def _init_claude_md(project: Path, lines: list[str]) -> None:
 
 
 def _init_settings(project: Path, python_path: str, lines: list[str]) -> None:
-    """把 SessionStart/Stop hook 合并进 ``.claude/settings.local.json``(不覆盖已有配置)。
+    """把 SessionStart/Stop hook 与 memory 保护 deny 规则合并进 ``.claude/settings.local.json``。
+
+    不覆盖用户已有配置:hook 按脚本名去重,deny 规则按字符串去重,只追加缺失项。
 
     Args:
         project: 目标项目根。
@@ -276,6 +322,18 @@ def _init_settings(project: Path, python_path: str, lines: list[str]) -> None:
     """
     path = project / SETTINGS_LOCAL_REL
     config = _read_json_obj(path)
+    hooks_changed = _merge_hooks(config, python_path, lines)
+    deny_changed = _merge_deny_rules(config, lines)
+    if hooks_changed or deny_changed:
+        _atomic_write_text(
+            path, json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+        )
+    else:
+        lines.append("• settings.local.json 无需改动")
+
+
+def _merge_hooks(config: dict, python_path: str, lines: list[str]) -> bool:
+    """把 SessionStart/Stop hook 合并进 ``config["hooks"]``;返回是否有改动。"""
     hooks = config.setdefault("hooks", {})
     changed = False
     for event, script, timeout in HOOK_SPECS:
@@ -299,12 +357,30 @@ def _init_settings(project: Path, python_path: str, lines: list[str]) -> None:
         )
         changed = True
         lines.append(f"• settings.local.json 添加 {event} hook → {script}")
-    if changed:
-        _atomic_write_text(
-            path, json.dumps(config, ensure_ascii=False, indent=2) + "\n"
-        )
-    else:
-        lines.append("• settings.local.json 无需改动")
+    return changed
+
+
+def _merge_deny_rules(config: dict, lines: list[str]) -> bool:
+    """把 :data:`PERMISSION_DENY_RULES` 合并进 ``config["permissions"]["deny"]``;返回是否有改动。
+
+    若 ``permissions`` 或 ``permissions.deny`` 已存在但类型异常(非 dict/非 list),
+    跳过并告警以避免破坏用户的手写配置。
+    """
+    permissions = config.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        lines.append("• settings.local.json 的 permissions 非对象,跳过 deny 规则注入")
+        return False
+    deny = permissions.setdefault("deny", [])
+    if not isinstance(deny, list):
+        lines.append("• settings.local.json 的 permissions.deny 非数组,跳过 deny 规则注入")
+        return False
+    added = [rule for rule in PERMISSION_DENY_RULES if rule not in deny]
+    if not added:
+        lines.append("• settings.local.json 已含本工具 memory 保护 deny 规则,跳过")
+        return False
+    deny.extend(added)
+    lines.append(f"• settings.local.json 添加 {len(added)} 条 memory 保护 deny 规则")
+    return True
 
 
 def _init_memory_skeleton(project: Path, lines: list[str]) -> None:
@@ -392,7 +468,7 @@ def _read_text_tail(path: Path, offset: int) -> str:
 
 
 def cmd_destroy(project: Path) -> int:
-    """仅移除本工具写入的 hook 条目;保留 .claude/memory/ 与 CLAUDE.md 引用。"""
+    """移除本工具写入的 hook 条目与 memory 保护 deny 规则;保留 .claude/memory/ 与 CLAUDE.md 引用。"""
     path = project / SETTINGS_LOCAL_REL
     lines = [f"self-improve destroy @ {project}"]
     if not path.exists():
@@ -401,10 +477,22 @@ def cmd_destroy(project: Path) -> int:
         return 0
 
     config = _read_json_obj(path)
+    hooks_removed = _remove_hooks(config, lines)
+    deny_removed = _remove_deny_rules(config, lines)
+    if hooks_removed or deny_removed:
+        _atomic_write_text(
+            path, json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+        )
+    lines.append("• 已保留 .claude/memory/(记忆未删) 与 CLAUDE.md 引用")
+    print("\n".join(lines))
+    return 0
+
+
+def _remove_hooks(config: dict, lines: list[str]) -> int:
+    """从 ``config["hooks"]`` 移除本工具的 hook 条目;返回移除数量。"""
     hooks = config.get("hooks")
     if not isinstance(hooks, dict):
-        lines.append("• settings.local.json 无 hooks 段,无操作")
-        print("\n".join(lines))
+        lines.append("• settings.local.json 无 hooks 段,无 hook 可移除")
         return 0
 
     removed = 0
@@ -428,15 +516,35 @@ def cmd_destroy(project: Path) -> int:
         config.pop("hooks", None)
 
     if removed:
-        _atomic_write_text(
-            path, json.dumps(config, ensure_ascii=False, indent=2) + "\n"
-        )
         lines.append(f"• 已从 settings.local.json 移除 {removed} 个本工具 hook 条目")
     else:
         lines.append("• 未发现本工具的 hook 条目,无操作")
-    lines.append("• 已保留 .claude/memory/(记忆未删) 与 CLAUDE.md 引用")
-    print("\n".join(lines))
-    return 0
+    return removed
+
+
+def _remove_deny_rules(config: dict, lines: list[str]) -> int:
+    """从 ``config["permissions"]["deny"]`` 移除本工具的 memory 保护规则;返回移除数量。
+
+    清空后顺手收掉空的 ``deny`` 列表与空的 ``permissions`` 对象,保持配置整洁。
+    """
+    permissions = config.get("permissions")
+    if not isinstance(permissions, dict):
+        return 0
+    deny = permissions.get("deny")
+    if not isinstance(deny, list):
+        return 0
+    kept = [rule for rule in deny if rule not in PERMISSION_DENY_RULES]
+    removed = len(deny) - len(kept)
+    if not removed:
+        return 0
+    if kept:
+        permissions["deny"] = kept
+    else:
+        permissions.pop("deny", None)
+    if not permissions:
+        config.pop("permissions", None)
+    lines.append(f"• 已从 settings.local.json 移除 {removed} 条本工具 memory 保护 deny 规则")
+    return removed
 
 
 def _usage() -> str:

@@ -144,7 +144,11 @@ def run_extraction(
 
     prompt = _render_prompt(conversation)
     log.info("calling LLM model=%s prompt_chars=%d", MODEL, len(prompt))
-    result: dict | None = None
+    # 候选处理(enrich/append)与 extras 赋值都放进 with 块内:runlog 在 with 退出时即落盘,
+    # 块外再改 rec.extras 不会写进 meta.json。这样统计与空数组原因都能进 meta.json,便于回溯。
+    appended = 0
+    rejected = 0
+    advanced = False
     with runlog.record_run(
         cwd=cwd,
         hook_event="Stop",
@@ -156,46 +160,50 @@ def run_extraction(
             raw_response = claude_cli.run(prompt, model=MODEL, output_format="text", timeout=90)
             rec.response = raw_response
             result = claude_cli.extract_json_object(raw_response)
-            if result is None:
-                rec.error = "response is not valid JSON"
-            else:
-                rec.ok = True
         except claude_cli.ClaudeCliError as e:
             rec.error = str(e)
+            result = None
 
-    if result is None:
-        log.warning("extraction LLM failed; see runs/%s", rec.run_dir.name)
+        if result is None:
+            rec.error = rec.error or "response is not valid JSON"
+            log.warning("extraction LLM failed; see runs/%s", rec.run_dir.name)
+        else:
+            rec.ok = True
+            advanced = True
+            raw_candidates = result.get("candidates") or []
+            rec.extras["candidates_raw"] = len(raw_candidates)
+            if not raw_candidates:
+                reason = (result.get("reason") or "").strip() or "(LLM 未给出原因)"
+                rec.extras["empty_reason"] = reason
+                log.info("LLM returned no candidates; reason=%s", reason)
+            for item in raw_candidates:
+                enriched = _enrich(
+                    item=item,
+                    session_id=session_id,
+                    transcript_path=transcript_path,
+                    start_line=last_line + 1,
+                    end_line=total_lines,
+                )
+                if enriched is None:
+                    rejected += 1
+                    continue
+                atomic.append_jsonl_line(
+                    candidates_file, json.dumps(enriched, ensure_ascii=False)
+                )
+                appended += 1
+            rec.extras["candidates_appended"] = appended
+            rec.extras["candidates_rejected"] = rejected
+            log.info(
+                "appended %d / rejected %d candidates (lines %d..%d, run=%s)",
+                appended,
+                rejected,
+                last_line + 1,
+                total_lines,
+                rec.run_dir.name,
+            )
+
+    if not advanced:
         return _ExtractResult(advanced=False, appended=0, rejected=0)
-
-    raw_candidates = result.get("candidates") or []
-    log.info("LLM returned %d raw candidates", len(raw_candidates))
-    appended = 0
-    rejected = 0
-    for item in raw_candidates:
-        enriched = _enrich(
-            item=item,
-            session_id=session_id,
-            transcript_path=transcript_path,
-            start_line=last_line + 1,
-            end_line=total_lines,
-        )
-        if enriched is None:
-            rejected += 1
-            continue
-        atomic.append_jsonl_line(candidates_file, json.dumps(enriched, ensure_ascii=False))
-        appended += 1
-
-    rec.extras["candidates_raw"] = len(raw_candidates)
-    rec.extras["candidates_appended"] = appended
-    rec.extras["candidates_rejected"] = rejected
-    log.info(
-        "appended %d / rejected %d candidates (lines %d..%d, run=%s)",
-        appended,
-        rejected,
-        last_line + 1,
-        total_lines,
-        rec.run_dir.name,
-    )
     return _ExtractResult(advanced=True, appended=appended, rejected=rejected)
 
 
