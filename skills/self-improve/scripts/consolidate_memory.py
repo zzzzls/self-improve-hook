@@ -65,9 +65,11 @@ EMPTY_TEMPLATE = """# 项目记忆(自动生成)
 
 def main() -> int:
     """读取 hook 输入,执行合并流水线。无论成败均返回 0。"""
+    # 强制 UTF-8 读 stdin(见 learn_on_stop 的说明):无论来自 Claude Code 还是
+    # manager/session_start 的子进程 input,写入端均已钉成 UTF-8,两端一致。
     try:
-        payload = json.load(sys.stdin)
-    except json.JSONDecodeError:
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return 0
 
     cwd = payload.get("cwd")

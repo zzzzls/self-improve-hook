@@ -345,6 +345,7 @@ def cmd_update(project: Path) -> int:
             [sys.executable, str(consolidate)],
             input=json.dumps(payload),
             text=True,
+            encoding="utf-8",  # 与 consolidate 的 UTF-8 stdin 读取对齐(Windows 默认 cp936 会错配)
             timeout=CONSOLIDATE_TIMEOUT,
             check=False,
         )

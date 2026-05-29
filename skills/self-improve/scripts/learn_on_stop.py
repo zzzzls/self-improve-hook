@@ -44,9 +44,11 @@ def main() -> int:
     # 防递归:若本 hook 由 claude_cli 派生的子 claude -p 会话触发,直接退出。
     if os.environ.get(claude_cli.HOOK_GUARD_ENV):
         return 0
+    # Windows 中文区域下 sys.stdin 默认按 cp936 解码,会把 Claude Code 以 UTF-8
+    # 传入的负载(含中文路径)解成乱码 → memory_dir 指向幽灵目录。强制按字节读再 UTF-8 解码。
     try:
-        payload = json.load(sys.stdin)
-    except json.JSONDecodeError:
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return 0
 
     if payload.get("stop_hook_active"):

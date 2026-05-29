@@ -48,9 +48,11 @@ def main() -> int:
     # 防递归:若本 hook 由 claude_cli 派生的子 claude -p 会话触发,直接退出。
     if os.environ.get(claude_cli.HOOK_GUARD_ENV):
         return 0
+    # 强制 UTF-8 读 stdin(见 learn_on_stop 的说明):Windows 中文区域默认 cp936
+    # 会把 UTF-8 负载里的中文路径解成乱码,导致 memory_dir 指向幽灵目录。
     try:
-        payload = json.load(sys.stdin)
-    except json.JSONDecodeError:
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return 0
 
     cwd = payload.get("cwd")
@@ -338,6 +340,7 @@ def _trigger_consolidate(*, cwd: Path, session_id: str, log: logging.Logger) -> 
             [sys.executable, str(CONSOLIDATE_SCRIPT)],
             input=json.dumps(payload),
             text=True,
+            encoding="utf-8",  # 与 consolidate 的 UTF-8 stdin 读取对齐(Windows 默认 cp936 会错配)
             timeout=240,
             check=False,
         )

@@ -92,15 +92,17 @@ def run(
     # 注意:不能用 --bare —— 它在跳过 hooks 的同时会一并跳过 keychain reads,
     # 导致子进程读不到登录凭证而报 "Not logged in" 退出。防递归改为依赖
     # 下方注入的 HOOK_GUARD_ENV(两个 hook 入口检测到它即立即退出)。
-    cmd = _build_argv(
-        claude,
-        ["--model", model, "--output-format", output_format, "-p", prompt],
-    )
+    # prompt 走 stdin 而非命令行参数:避免 Windows 上经 cmd /c 时被 shell 的引号/编码
+    # 处理弄坏或撞上命令行长度上限(表现为 claude 返回空);也契合 -p 从 stdin 读输入。
+    # encoding 固定 UTF-8,确保中文 prompt/输出在 Windows(默认 cp936)下不乱码。
+    cmd = _build_argv(claude, ["--model", model, "--output-format", output_format, "-p"])
     try:
         result = subprocess.run(
             cmd,
+            input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=timeout,
             check=False,
             env={**os.environ, HOOK_GUARD_ENV: "1"},
