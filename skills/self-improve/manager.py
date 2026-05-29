@@ -107,6 +107,24 @@ SEED_MEMORY = """# 项目记忆(自动生成)
 """
 
 
+def _force_utf8_stdio() -> None:
+    """把 stdout/stderr 钉死为 UTF-8,避免 Windows 默认 cp936/GBK 编码崩溃。
+
+    报告行里含 ``•``(\\u2022)等非 GBK 字符,Windows 中文区域下 stdout 默认走 cp936,
+    ``print`` 时会抛 :class:`UnicodeEncodeError` 致命令以非 0 退出(即便合并已成功)。
+    与项目 stdin/子进程 IO 统一钉 UTF-8 的约定一致。``reconfigure`` 为 Python 3.7+ 提供;
+    stdout 被替换为非 :class:`io.TextIOWrapper` 时静默跳过。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            continue
+
+
 def _now_iso() -> str:
     """返回当前本地时间的 ISO8601(秒级)字符串。"""
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -182,6 +200,7 @@ def _detect_python() -> str | None:
                 [exe, "-c", "import sys; print(sys.version_info[0])"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",  # 与全项目子进程文本 IO 统一钉 UTF-8(Windows 默认 cp936)
                 timeout=10,
                 check=False,
             )
@@ -558,6 +577,7 @@ def _usage() -> str:
 
 def main() -> int:
     """解析参数并分发到对应动作。"""
+    _force_utf8_stdio()
     parser = argparse.ArgumentParser(
         prog="self-improve", description="self-improve 流水线管理器"
     )
