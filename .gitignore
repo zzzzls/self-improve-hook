@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# self-improve 运行时产物(仅在被安装的目标项目里生成;若在本仓库 dogfood 亦忽略)
+.claude/memory/
+.claude/settings.local.json
+memory.generated.md
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
