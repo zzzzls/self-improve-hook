@@ -69,6 +69,7 @@ skills/self-improve/          # 流水线 skill —— 斜杠命令 /self-improv
 - **原子写**:文件写入全部走临时文件 + `os.replace`(`lib/atomic.py`);`candidates.jsonl` 依赖 `O_APPEND` 原子性以支持多会话并发追加。
 - **增量提取**:`state/<sid>.json` 的 `last_processed_line` 记录已处理行号,每次 Stop 只处理新增行。
 - **防循环**:Stop hook 收到 `stop_hook_active=true` 时立即返回。
+- **防 `claude -p` 递归(双保险)**:hook 内 `claude_cli.run` 派生子 `claude -p` 会重新触发 Stop/SessionStart hook,造成 fork-bomb。主手段是给子进程传 `--settings <随包 no_hooks.settings.json>`(内容 `{"disableAllHooks": true}`),从根上关掉子 claude 的所有 hook;兜底是注入 `HOOK_GUARD_ENV=SELF_IMPROVE_HOOK=1`、两个 hook 入口检测到即 `return 0`。优先 `--settings` 是因为环境变量在某些 shell/平台(尤其 Windows)可能不被子进程继承。`--settings` 用**文件路径**而非内联 JSON(Windows 上 claude 若为 `.cmd` 经 `cmd /c` 时内联 JSON 的引号会被 cmd.exe 破坏)。**切勿用 `--bare`**:它跳过 hooks 的同时也跳过 keychain reads,致子进程 `Not logged in`。
 - **6 种候选类型**(其它一律拒绝):`user_instruction` / `project_convention` / `error_lesson` / `tool_preference` / `workflow_convention` / `issue_fix`。
 - **多窗口并发安全(原子领取)**:同时打开多个窗口会触发多个 `consolidate`。consolidate 进来先用 `atomic.claim_file` 把 `candidates.jsonl` 经 `os.replace` 原子改名成进程唯一名(`candidates.claiming-<pid>-<token>.jsonl`),只有抢到的进程跑 LLM,其余秒退 —— 这是天然的 N 进程互斥点。领取后 Stop hook 的新候选落到新建的 `candidates.jsonl`,不会被本轮归档(零丢失)。恢复路径对遗留 `<sid>.json` 同样做 rename-claim,避免并发重复提取。**刻意不用 flock**:项目在 9p/DrvFs 挂载上 flock 不可靠,互斥一律走 `os.replace`。
 - **崩溃自愈**:consolidate 崩溃残留的领取文件(`candidates.claiming-*`)、恢复崩溃残留的 `<sid>.json.recovering-*`,都由下次 `SessionStart` 扫描回收(靠 `os.kill(pid,0)` 区分孤儿与在跑进程,跳过存活 owner)。

@@ -21,6 +21,10 @@ HOOK_GUARD_ENV = "SELF_IMPROVE_HOOK"
 # 因为 hook 所在 shell(Windows 的 Git Bash/PowerShell)的 PATH 可能找不到裸名 claude。
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
+# 随包的设置文件,内容为 {"disableAllHooks": true}:调子 claude 时用 --settings 指向它,
+# 从根上关掉子进程的所有 hook、杜绝递归(比仅靠 HOOK_GUARD_ENV 环境变量继承更可靠)。
+_NO_HOOKS_SETTINGS = Path(__file__).resolve().parent.parent / "no_hooks.settings.json"
+
 
 class ClaudeCliError(RuntimeError):
     """claude CLI 调用失败。"""
@@ -57,6 +61,17 @@ def _build_argv(claude: str, args: list[str]) -> list[str]:
     return [claude, *args]
 
 
+def _disable_hooks_value() -> str:
+    """``--settings`` 的取值:优先用随包设置文件的路径,缺失则回退为内联 JSON 字符串。
+
+    用文件路径而非内联 JSON,是因为 Windows 上 claude 若为 ``.cmd`` 要经 ``cmd /c``,
+    内联 JSON 里的引号极易被 cmd.exe 破坏;路径参数则不受影响。
+    """
+    if _NO_HOOKS_SETTINGS.exists():
+        return str(_NO_HOOKS_SETTINGS)
+    return '{"disableAllHooks":true}'
+
+
 def is_available() -> bool:
     """检测 claude CLI 是否可用(config.json 绝对路径存在,或在 PATH 中)。"""
     return _resolve_claude() is not None
@@ -89,13 +104,21 @@ def run(
             "claude CLI not found(请检查 scripts/config.json 的 claude 绝对路径,"
             "或确保 claude 在 PATH 中)"
         )
-    # 注意:不能用 --bare —— 它在跳过 hooks 的同时会一并跳过 keychain reads,
-    # 导致子进程读不到登录凭证而报 "Not logged in" 退出。防递归改为依赖
-    # 下方注入的 HOOK_GUARD_ENV(两个 hook 入口检测到它即立即退出)。
+    # 防递归:用 --settings 关掉子 claude 的所有 hook(主手段,见 _disable_hooks_value);
+    # 同时保留下方注入的 HOOK_GUARD_ENV 作为兜底(双保险)。不能用 --bare —— 它在跳过
+    # hooks 的同时会一并跳过 keychain reads,导致子进程读不到登录凭证而报 "Not logged in"。
     # prompt 走 stdin 而非命令行参数:避免 Windows 上经 cmd /c 时被 shell 的引号/编码
     # 处理弄坏或撞上命令行长度上限(表现为 claude 返回空);也契合 -p 从 stdin 读输入。
     # encoding 固定 UTF-8,确保中文 prompt/输出在 Windows(默认 cp936)下不乱码。
-    cmd = _build_argv(claude, ["--model", model, "--output-format", output_format, "-p"])
+    cmd = _build_argv(
+        claude,
+        [
+            "--model", model,
+            "--output-format", output_format,
+            "--settings", _disable_hooks_value(),
+            "-p",
+        ],
+    )
     try:
         result = subprocess.run(
             cmd,
