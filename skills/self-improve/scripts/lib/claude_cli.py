@@ -10,20 +10,56 @@ import json
 import os
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
 
 # 子进程会继承该环境变量;hook 入口检测到它即立即退出,
 # 防止 claude -p 子会话递归触发 Stop/SessionStart hook。
 HOOK_GUARD_ENV = "SELF_IMPROVE_HOOK"
 
+# init 把 claude CLI 的绝对路径写在这里(scripts/config.json);运行时优先读它,
+# 因为 hook 所在 shell(Windows 的 Git Bash/PowerShell)的 PATH 可能找不到裸名 claude。
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+
 
 class ClaudeCliError(RuntimeError):
     """claude CLI 调用失败。"""
 
 
+def _configured_claude() -> str | None:
+    """从 scripts/config.json 读取 init 烘焙的 claude 绝对路径;无/损坏返回 None。"""
+    try:
+        data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    path = data.get("claude")
+    return path.strip() if isinstance(path, str) and path.strip() else None
+
+
+def _resolve_claude() -> str | None:
+    """定位可用的 claude:优先 config.json 的绝对路径,回退到 PATH 查找。
+
+    Returns:
+        一个可执行的 claude 路径(绝对路径或 PATH 中找到的);都没有时返回 None。
+    """
+    configured = _configured_claude()
+    if configured and Path(configured).exists():
+        return configured
+    return shutil.which("claude")
+
+
+def _build_argv(claude: str, args: list[str]) -> list[str]:
+    """构造 subprocess 参数;Windows 下 .cmd/.bat 需经 ``cmd /c`` 才能被拉起。"""
+    if os.name == "nt" and claude.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c", claude, *args]
+    return [claude, *args]
+
+
 def is_available() -> bool:
-    """检测 claude CLI 是否在 PATH 中可用。"""
-    return shutil.which("claude") is not None
+    """检测 claude CLI 是否可用(config.json 绝对路径存在,或在 PATH 中)。"""
+    return _resolve_claude() is not None
 
 
 def run(
@@ -47,20 +83,19 @@ def run(
     Raises:
         ClaudeCliError: CLI 不可用、返回非 0 或超时。
     """
-    if not is_available():
-        raise ClaudeCliError("claude CLI not found in PATH")
-    cmd = [
-        "claude",
-        # 注意:不能用 --bare —— 它在跳过 hooks 的同时会一并跳过 keychain reads,
-        # 导致子进程读不到登录凭证而报 "Not logged in" 退出。防递归改为依赖
-        # 下方注入的 HOOK_GUARD_ENV(两个 hook 入口检测到它即立即退出)。
-        "--model",
-        model,
-        "--output-format",
-        output_format,
-        "-p",
-        prompt,
-    ]
+    claude = _resolve_claude()
+    if claude is None:
+        raise ClaudeCliError(
+            "claude CLI not found(请检查 scripts/config.json 的 claude 绝对路径,"
+            "或确保 claude 在 PATH 中)"
+        )
+    # 注意:不能用 --bare —— 它在跳过 hooks 的同时会一并跳过 keychain reads,
+    # 导致子进程读不到登录凭证而报 "Not logged in" 退出。防递归改为依赖
+    # 下方注入的 HOOK_GUARD_ENV(两个 hook 入口检测到它即立即退出)。
+    cmd = _build_argv(
+        claude,
+        ["--model", model, "--output-format", output_format, "-p", prompt],
+    )
     try:
         result = subprocess.run(
             cmd,

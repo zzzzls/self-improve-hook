@@ -9,6 +9,8 @@ venv/
 .claude/memory/
 .claude/settings.local.json
 memory.generated.md
+# init 探测并写入的本机解释器/CLI 绝对路径(逐机器不同,不入库)
+skills/self-improve/scripts/config.json
 
 # 编辑器 / 系统
 .DS_Store

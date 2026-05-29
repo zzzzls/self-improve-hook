@@ -30,6 +30,8 @@ from datetime import datetime
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+# 运行时配置:记录探测到的解释器/CLI 绝对路径,供 hook 与脚本读取(用户可手改)
+CONFIG_PATH = SCRIPTS_DIR / "config.json"
 
 MEMORY_DIRNAME = ".claude/memory"
 # 最终产出落在项目根,内部文件(候选/归档/state)仍在 MEMORY_DIRNAME 下
@@ -49,7 +51,8 @@ HOOK_SPECS = (
 OUR_SCRIPT_NAMES = ("session_start.py", "learn_on_stop.py")
 CONSOLIDATE_SCRIPT = "consolidate_memory.py"
 
-# init 烘焙 hook command 前,按此顺序探测解释器,选用第一个确为 Python 3 的命令名
+# init 烘焙 hook command 前,按此顺序探测解释器,选用第一个确为 Python 3 的;
+# 烘焙/记录的是其**绝对路径**(hook 在 Windows 的 Git Bash/PowerShell 里跑,裸名可能解析不到)
 PYTHON_CANDIDATES = ("python3", "python")
 
 ACTIONS = ("init", "update", "destroy")
@@ -135,17 +138,16 @@ def _event_has_script(groups: list, script: str) -> bool:
     )
 
 
-def _detect_python_command() -> str | None:
-    """探测一个可用的 Python 3 解释器命令名,供 hook command 烘焙使用。
+def _detect_python() -> str | None:
+    """探测一个可用的 Python 3 解释器,返回其**绝对路径**(供烘焙 hook command 用)。
 
     按 :data:`PYTHON_CANDIDATES` 顺序(``python3`` → ``python``)逐个尝试:
-    先用 ``shutil.which`` 确认在 PATH 中存在,再实际执行确认主版本号为 3。
-    这样可避免把 ``python`` 误当成 Python 2,也能在没有 ``python3`` 别名、
-    只有 ``python`` 指向 Python 3 的环境里正确选用。
+    用 ``shutil.which`` 把命令名解析为绝对路径,再实际执行确认主版本号为 3。
+    返回绝对路径而非裸名,是因为 hook 在 Windows 上由 Git Bash/PowerShell 执行,
+    其 PATH 可能与安装环境不同,裸名 ``python`` 常解析不到(或落到商店占位)。
 
     Returns:
-        第一个确为 Python 3.x 的命令名(``"python3"`` 或 ``"python"``);
-        两者都不存在或均非 Python 3 时返回 None。
+        第一个确为 Python 3.x 的解释器**绝对路径**;都不可用时返回 None。
     """
     for name in PYTHON_CANDIDATES:
         exe = shutil.which(name)
@@ -162,15 +164,45 @@ def _detect_python_command() -> str | None:
         except (OSError, subprocess.SubprocessError):
             continue
         if proc.returncode == 0 and proc.stdout.strip() == "3":
-            return name
+            return exe
     return None
 
 
+def _detect_claude() -> str | None:
+    """把 ``claude`` CLI 解析为绝对路径(``shutil.which``);找不到返回 None。
+
+    与 Python 同理:运行时 hook 所在 shell 的 PATH 可能找不到裸名 ``claude``,
+    故烘焙绝对路径写入 config.json,由 ``lib/claude_cli.py`` 读取。
+    """
+    return shutil.which("claude")
+
+
+def _read_config() -> dict:
+    """读取 skill 下的运行时 config.json;不存在或损坏一律视为空(由 init 重建)。"""
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _config_choose(existing: object, detected: str | None) -> str | None:
+    """优先沿用 config.json 里仍有效(文件存在)的手填/旧值,否则用新探测值。
+
+    这样用户对 config.json 的手动修改不会被后续 ``init`` 覆盖。
+    """
+    if isinstance(existing, str) and existing.strip() and Path(existing.strip()).exists():
+        return existing.strip()
+    return detected
+
+
 def cmd_init(project: Path) -> int:
-    """在 ``project`` 启用 self-improve:先探测 Python 3,再接 CLAUDE.md、写 hook、建骨架。"""
+    """在 ``project`` 启用 self-improve:探测解释器/CLI 绝对路径并写 config.json,
+    再接 CLAUDE.md、写 hook、建骨架。"""
     lines = [f"self-improve init @ {project}"]
-    python_cmd = _detect_python_command()
-    if python_cmd is None:
+    existing = _read_config()
+    python_path = _config_choose(existing.get("python"), _detect_python())
+    if python_path is None:
         lines.append(
             "• 未检测到可用的 Python 3 解释器(已尝试 "
             + " / ".join(PYTHON_CANDIDATES)
@@ -183,15 +215,36 @@ def cmd_init(project: Path) -> int:
         lines.append("• 已中止:未创建任何 hook,也未改动 CLAUDE.md / memory。")
         print("\n".join(lines))
         return 1
-    lines.append(f"• 检测到 Python 3 解释器:{python_cmd}")
+    lines.append(f"• Python 3 解释器(绝对路径):{python_path}")
+    claude_path = _config_choose(existing.get("claude"), _detect_claude())
+    if claude_path:
+        lines.append(f"• claude CLI(绝对路径):{claude_path}")
+    else:
+        lines.append(
+            "• 未在 PATH 中找到 claude CLI:config.json 的 claude 暂留空,"
+            "请手动填入其绝对路径(否则提取/合并会被静默跳过)"
+        )
+    _init_config(python_path, claude_path, lines)
     _init_claude_md(project, lines)
-    _init_settings(project, python_cmd, lines)
+    _init_settings(project, python_path, lines)
     _init_memory_skeleton(project, lines)
     lines.append(
         "提示:自动 hook 通常下次会话才加载(可能需经 /hooks 审核);update 立即可用。"
     )
+    lines.append(
+        f"提示:解释器/CLI 路径记录在 {CONFIG_PATH},可手动修改(后续 init 不会覆盖仍有效的值)。"
+    )
     print("\n".join(lines))
     return 0
+
+
+def _init_config(python_path: str, claude_path: str | None, lines: list[str]) -> None:
+    """把探测到的解释器/CLI 绝对路径写入 skill 下的 config.json(运行时读取、用户可手改)。"""
+    config = {"python": python_path, "claude": claude_path}
+    _atomic_write_text(
+        CONFIG_PATH, json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+    )
+    lines.append(f"• 写入运行时配置:{CONFIG_PATH}")
 
 
 def _init_claude_md(project: Path, lines: list[str]) -> None:
@@ -212,12 +265,13 @@ def _init_claude_md(project: Path, lines: list[str]) -> None:
     )
 
 
-def _init_settings(project: Path, python_cmd: str, lines: list[str]) -> None:
+def _init_settings(project: Path, python_path: str, lines: list[str]) -> None:
     """把 SessionStart/Stop hook 合并进 ``.claude/settings.local.json``(不覆盖已有配置)。
 
     Args:
         project: 目标项目根。
-        python_cmd: 已探测确认为 Python 3 的解释器命令名,用于烘焙 hook command。
+        python_path: 已确认为 Python 3 的解释器**绝对路径**,烘焙进 hook command
+            (绝对路径 + 引号包裹,兼容含空格的安装目录与 Windows 的 Git Bash/PowerShell)。
         lines: 累加输出报告行的列表。
     """
     path = project / SETTINGS_LOCAL_REL
@@ -229,7 +283,7 @@ def _init_settings(project: Path, python_cmd: str, lines: list[str]) -> None:
         if _event_has_script(groups, script):
             lines.append(f"• settings.local.json {event} 已有本工具 hook,跳过")
             continue
-        command = f'{python_cmd} "{SCRIPTS_DIR / script}"'
+        command = f'"{python_path}" "{SCRIPTS_DIR / script}"'
         groups.append(
             {
                 "matcher": "*",
